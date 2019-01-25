@@ -48,17 +48,30 @@ opt=adadelta
 epochs=10
 
 # rnnlm related
-lm_weight=1.0
-use_wordlm=true
-vocabsize=65000
+use_wordlm=true     # false means to train/use a character LM
+lm_vocabsize=65000  # effective only for word LMs
+lm_layers=1         # 2 for character LMs
+lm_units=1000       # 650 for character LMs
+lm_opt=sgd          # adam for character LMs
+lm_batchsize=300    # 1024 for character LMs
+lm_epochs=20        # number of epochs
+lm_maxlen=40        # 150 for character LMs
+lm_resume=          # specify a snapshot file to resume LM training
+lmtag=              # tag for managing LMs
 
 # decoding parameter
+lm_weight=1.0
 beam_size=30
 penalty=0
 maxlenratio=0.0
 minlenratio=0.0
 ctc_weight=0.3
 recog_model=model.acc.best # set a model to be used for decoding: 'model.acc.best' or 'model.loss.best'
+
+# Dereverberation Measures
+compute_se=true # flag for turing on computation of dereverberation measures
+enable_pesq=false # please make sure that you or your institution have the license to report PESQ before turning on this flag
+nch_se=8
 
 # data
 reverb=/export/corpora5/REVERB_2014/REVERB    # JHU setup
@@ -83,16 +96,30 @@ set -o pipefail
 
 train_set=tr_simu_8ch_si284
 train_dev=dt_mult_1ch
-recog_set="dt_real_1ch dt_simu_1ch et_real_1ch et_simu_1ch"
+recog_set="dt_real_8ch_beamformit dt_simu_8ch_beamformit et_real_8ch_beamformit et_simu_8ch_beamformit dt_real_1ch_wpe dt_simu_1ch_wpe et_real_1ch_wpe et_simu_1ch_wpe"
 
 if [ ${stage} -le 0 ]; then
     ### Task dependent. You have to make the following data preparation part by yourself.
     ### But you can utilize Kaldi recipes in most cases
-    wavdir=$PWD/wav # set the directory of the multi-condition training WAV files to be generated
+    wavdir=${PWD}/wav # set the directory of the multi-condition training WAV files to be generated
     echo "stage 0: Data preparation"
     local/generate_data.sh --wavdir ${wavdir} ${wsjcam0}
     local/prepare_simu_data.sh --wavdir ${wavdir} ${reverb} ${wsjcam0}
-    local/prepare_real_data.sh ${reverb}
+    local/prepare_real_data.sh --wavdir ${wavdir} ${reverb}
+    
+    # Run WPE and Beamformit
+    local/run_wpe.sh
+    local/run_beamform.sh ${wavdir}/WPE/
+    if $compute_se; then
+      if [ ! -d local/REVERB_scores_source ] || [ ! -d local/REVERB_scores_source/REVERB-SPEENHA.Release04Oct/evaltools/SRMRToolbox ] || [ ! -f local/PESQ ]; then
+        # download and install speech enhancement evaluation tools
+        local/download_se_eval_tool.sh
+      fi
+      pesqdir=${PWD}/local
+      local/compute_se_scores.sh --nch $nch_se --enable_pesq $enable_pesq $reverb $wavdir $pesqdir
+      cat exp/compute_se_${nch_se}ch/scores/score_SimData
+      cat exp/compute_se_${nch_se}ch/scores/score_RealData
+    fi
 
     # Additionally use WSJ clean data. Otherwise the encoder decoder is not well trained
     local/wsj_data_prep.sh ${wsj0}/??-{?,??}.? ${wsj1}/??-{?,??}.?
@@ -177,53 +204,60 @@ fi
 
 # It takes a few days. If you just want to end-to-end ASR without LM,
 # you can skip this and remove --rnnlm option in the recognition (stage 5)
-if [ $use_wordlm = true ]; then
-    lmdatadir=data/local/wordlm_train
-    lm_batchsize=256
-    lmexpdir=exp/train_rnnlm_${backend}_word_2layer_bs${lm_batchsize}
-    lmdict=${lmexpdir}/wordlist_${vocabsize}.txt
-else
-    lmdatadir=data/local/lm_train
-    lm_batchsize=2048
-    lmexpdir=exp/train_rnnlm_${backend}_2layer_bs${lm_batchsize}
-    lmdict=$dict
+if [ -z ${lmtag} ]; then
+    lmtag=${lm_layers}layer_unit${lm_units}_${lm_opt}_bs${lm_batchsize}
+    if [ $use_wordlm = true ]; then
+        lmtag=${lmtag}_word${lm_vocabsize}
+    fi
 fi
+lmexpdir=exp/train_rnnlm_${backend}_${lmtag}
 mkdir -p ${lmexpdir}
+
 if [ ${stage} -le 3 ]; then
     echo "stage 3: LM Preparation"
-    mkdir -p ${lmdatadir}
     if [ $use_wordlm = true ]; then
-	cat data-fbank/${train_set}/text | cut -f 2- -d" " | perl -pe 's/\n/ <eos> /g' \
-							    > ${lmdatadir}/train_trans.txt
-	zcat ${wsj1}/13-32.1/wsj1/doc/lng_modl/lm_train/np_data/{87,88,89}/*.z | grep -v "<" | tr [a-z] [A-Z] \
-	    | perl -pe 's/\n/ <eos> /g' > ${lmdatadir}/train_others.txt
-	cat ${lmdatadir}/train_trans.txt ${lmdatadir}/train_others.txt | tr '\n' ' ' > ${lmdatadir}/train.txt
-	cat data-fbank/${train_dev}/text | cut -f 2- -d" " | perl -pe 's/\n/ <eos> /g' \
-							    > ${lmdatadir}/valid.txt
-	text2vocabulary.py -s ${vocabsize} -o ${lmdict} ${lmdatadir}/train.txt
+        lmdatadir=data/local/wordlm_train
+        lmdict=${lmdatadir}/wordlist_${lm_vocabsize}.txt
+        mkdir -p ${lmdatadir}
+        cat data/${train_set}/text | cut -f 2- -d" " > ${lmdatadir}/train_trans.txt
+        zcat ${wsj1}/13-32.1/wsj1/doc/lng_modl/lm_train/np_data/{87,88,89}/*.z \
+                | grep -v "<" | tr [a-z] [A-Z] > ${lmdatadir}/train_others.txt
+        cat data/${train_dev}/text | cut -f 2- -d" " > ${lmdatadir}/valid.txt
+        cat ${lmdatadir}/train_trans.txt ${lmdatadir}/train_others.txt > ${lmdatadir}/train.txt
+        text2vocabulary.py -s ${lm_vocabsize} -o ${lmdict} ${lmdatadir}/train.txt
     else
-	text2token.py -s 1 -n 1 -l ${nlsyms} data-fbank/${train_set}/text | cut -f 2- -d" " | perl -pe 's/\n/ <eos> /g' \
-											     > ${lmdatadir}/train_trans.txt
-	zcat ${wsj1}/13-32.1/wsj1/doc/lng_modl/lm_train/np_data/{87,88,89}/*.z | grep -v "<" | tr [a-z] [A-Z] \
-	    | text2token.py -n 1 | cut -f 2- -d" " | perl -pe 's/\n/ <eos> /g' >> ${lmdatadir}/train_others.txt
-	cat ${lmdatadir}/train_trans.txt ${lmdatadir}/train_others.txt | tr '\n' ' ' > ${lmdatadir}/train.txt
-	text2token.py -s 1 -n 1 -l ${nlsyms} data-fbank/${train_dev}/text | cut -f 2- -d" " | perl -pe 's/\n/ <eos> /g' \
-											     > ${lmdatadir}/valid.txt
+        lmdatadir=data/local/lm_train
+        lmdict=$dict
+        mkdir -p ${lmdatadir}
+        text2token.py -s 1 -n 1 -l ${nlsyms} data/${train_set}/text \
+            | cut -f 2- -d" " > ${lmdatadir}/train_trans.txt
+        zcat ${wsj1}/13-32.1/wsj1/doc/lng_modl/lm_train/np_data/{87,88,89}/*.z \
+            | grep -v "<" | tr [a-z] [A-Z] \
+            | text2token.py -n 1 | cut -f 2- -d" " > ${lmdatadir}/train_others.txt
+        text2token.py -s 1 -n 1 -l ${nlsyms} data/${train_dev}/text \
+            | cut -f 2- -d" " > ${lmdatadir}/valid.txt
+        cat ${lmdatadir}/train_trans.txt ${lmdatadir}/train_others.txt > ${lmdatadir}/train.txt
     fi
     # use only 1 gpu
     if [ ${ngpu} -gt 1 ]; then
 	echo "LM training does not support multi-gpu. single gpu will be used."
     fi
-    ${cuda_cmd} ${lmexpdir}/train.log \
-		lm_train.py \
-		--ngpu ${ngpu} \
-		--backend ${backend} \
-		--verbose 1 \
-		--outdir ${lmexpdir} \
-		--train-label ${lmdatadir}/train.txt \
-		--valid-label ${lmdatadir}/valid.txt \
-		--batchsize ${lm_batchsize} \
-		--dict ${lmdict}
+    ${cuda_cmd} --gpu ${ngpu} ${lmexpdir}/train.log \
+        lm_train.py \
+        --ngpu ${ngpu} \
+        --backend ${backend} \
+        --verbose 1 \
+        --outdir ${lmexpdir} \
+        --train-label ${lmdatadir}/train.txt \
+        --valid-label ${lmdatadir}/valid.txt \
+        --resume ${lm_resume} \
+        --layer ${lm_layers} \
+        --unit ${lm_units} \
+        --opt ${lm_opt} \
+        --batchsize ${lm_batchsize} \
+        --epoch ${lm_epochs} \
+        --maxlen ${lm_maxlen} \
+        --dict ${lmdict}
 fi
 
 if [ -z ${tag} ]; then
@@ -276,14 +310,16 @@ if [ ${stage} -le 5 ]; then
 
     for rtask in ${recog_set}; do
     (
-        decode_dir=decode_${rtask}_beam${beam_size}_e${recog_model}_p${penalty}_len${minlenratio}-${maxlenratio}_ctcw${ctc_weight}
         if [ $use_wordlm = true ]; then
-	    decode_dir=${decode_dir}_wordrnnlm${lm_weight}
-	    recog_opts="--word-rnnlm ${lmexpdir}/rnnlm.model.best --word-dict ${lmdict}"
-	else
-	    decode_dir=${decode_dir}_rnnlm${lm_weight}
-	    recog_opts="--rnnlm ${lmexpdir}/rnnlm.model.best"
-	fi
+            decode_dir=decode_${rtask}_beam${beam_size}_e${recog_model}_p${penalty}_len${minlenratio}-${maxlenratio}_ctcw${ctc_weight}_wordrnnlm${lm_weight}_${lmtag}
+        else
+            decode_dir=decode_${rtask}_beam${beam_size}_e${recog_model}_p${penalty}_len${minlenratio}-${maxlenratio}_ctcw${ctc_weight}_rnnlm${lm_weight}_${lmtag}
+        fi
+        if [ $use_wordlm = true ]; then
+            recog_opts="--word-rnnlm ${lmexpdir}/rnnlm.model.best"
+        else
+            recog_opts="--rnnlm ${lmexpdir}/rnnlm.model.best"
+        fi
         feat_recog_dir=${dumpdir}/${rtask}/delta${do_delta}
 
         # split data
@@ -317,12 +353,10 @@ if [ ${stage} -le 5 ]; then
     echo "Report the result"
     decode_part_dir=beam${beam_size}_e${recog_model}_p${penalty}_len${minlenratio}-${maxlenratio}_ctcw${ctc_weight}
     if [ $use_wordlm = true ]; then
-	decode_part_dir=${decode_part_dir}_wordrnnlm${lm_weight}
+	decode_part_dir=${decode_part_dir}_wordrnnlm${lm_weight}_${lmtag}
     else
-	decode_part_dir=${decode_part_dir}_rnnlm${lm_weight}
+	decode_part_dir=${decode_part_dir}_rnnlm${lm_weight}_${lmtag}
     fi
-    local/score_for_reverb.sh --wer true --nlsyms ${nlsyms} \
-			      "${expdir}/decode_*_1ch_${decode_part_dir}/data.json" \
-			      ${dict} ${expdir}/decode_summary_1ch_${decode_part_dir}
+    local/get_results.sh ${nlsyms} ${dict} ${expdir} ${decode_part_dir}
     echo "Finished"
 fi
